@@ -1,0 +1,32 @@
+{
+    "KPlugin": {
+        "Id": "AdvancedPlot",
+        "License": "GPL",
+        "Name": "AdvancedPlot",
+        "Name[ca@valencia]": "GràficAvançat",
+        "Name[ca]": "GràficAvançat",
+        "Name[cs]": "Pokročilý graf",
+        "Name[de]": "Erweitertes Plotten",
+        "Name[el]": "Προηγμένη απεικόνιση",
+        "Name[es]": "Gráficos avanzados",
+        "Name[et]": "Täiustatud joonis",
+        "Name[fr]": "Graphe avancé",
+        "Name[ia]": "AdvancedPlot(Traciar Avantiate)",
+        "Name[it]": "Grafico avanzato",
+        "Name[ka]": "ხაზვა",
+        "Name[ko]": "고급 플롯",
+        "Name[nn]": "AvansertPlott",
+        "Name[pl]": "Rozbudowane wykresy",
+        "Name[pt]": "Gráfico Avançado",
+        "Name[pt_BR]": "Gráfico avançado",
+        "Name[ru]": "Настраиваемый график",
+        "Name[sl]": "Napredni Graf",
+        "Name[sv]": "Avancerat diagram",
+        "Name[tr]": "GelişmişGrafik",
+        "Name[uk]": "Складне креслення",
+        "Name[x-test]": "xxAdvancedPlotxx",
+        "Name[zh_CN]": "高级绘图",
+        "Name[zh_TW]": "進階繪製"
+    },
+    "RequiredExtensions": "AdvancedPlotExtension"
+}

@@ -1,0 +1,612 @@
+From 09745b6c10b79daebfae40753983b3f7a696bb1e Mon Sep 17 00:00:00 2001
+From: helloydh007 <296340111+helloydh007@users.noreply.github.com>
+Date: Sun, 1 Nov 2026 22:55:12 +0800
+Subject: [PATCH] Python backend: allow selecting the interpreter at runtime
+
+Add an Interpreter setting (URL, defaults to python3) to the Python
+backend. When it points to an executable, the session runs the newly
+added pure-Python server (src/backends/python/server.py, embedded via
+python.qrc) with that interpreter instead of the libpython-linked
+cantor_pythonserver binary. Empty or unusable paths fall back to the
+embedded server, preserving the previous behaviour.
+
+The external server implements the same wire protocol as the embedded
+one (code/model/setFilePath/exit, capture of stdout/stderr, variable
+introspection, interrupt handling). Also make the login handshake
+tolerate a 'ready' token without a trailing newline and fail cleanly
+when the process cannot start.
+---
+ src/backends/python/python.qrc         |   1 +
+ src/backends/python/pythonbackend.cpp  |  12 ++
+ src/backends/python/pythonbackend.kcfg |   4 +
+ src/backends/python/pythonsession.cpp  |  96 ++++++++-
+ src/backends/python/server.py          | 264 +++++++++++++++++++++++++
+ src/backends/python/settings.ui        |  39 +++-
+ 6 files changed, 396 insertions(+), 20 deletions(-)
+ create mode 100644 src/backends/python/server.py
+
+diff --git a/src/backends/python/python.qrc b/src/backends/python/python.qrc
+index 5c6b133b..365517f0 100644
+--- a/src/backends/python/python.qrc
++++ b/src/backends/python/python.qrc
+@@ -3,5 +3,6 @@
+         <file>variables_cleaner.py</file>
+         <file>variables_loader.py</file>
+         <file>variables_saver.py</file>
++        <file>server.py</file>
+     </qresource>
+ </RCC>
+diff --git a/src/backends/python/pythonbackend.cpp b/src/backends/python/pythonbackend.cpp
+index db6cfea6..4abcd4ee 100644
+--- a/src/backends/python/pythonbackend.cpp
++++ b/src/backends/python/pythonbackend.cpp
+@@ -11,6 +11,7 @@
+ #include "ui_settings.h"
+ 
+ #include <QDebug>
++#include <QFileInfo>
+ #include <QWidget>
+ 
+ #include <KPluginFactory>
+@@ -80,11 +81,22 @@ KConfigSkeleton* PythonBackend::config() const
+ 
+ bool PythonBackend::requirementsFullfilled(QString* const reason) const
+ {
++    const QString& interpreterPath = PythonSettings::interpreter().toLocalFile();
++    if (!interpreterPath.isEmpty() && QFileInfo(interpreterPath).isExecutable())
++    {
++        return Cantor::Backend::checkExecutable(i18n("Python interpreter"), interpreterPath, reason);
++    }
++
+ #ifdef Q_OS_WIN
+     const QString& path = QStandardPaths::findExecutable(QLatin1String("cantor_pythonserver.exe"));
+ #else
+     const QString& path = QStandardPaths::findExecutable(QLatin1String("cantor_pythonserver"));
+ #endif
++    // The embedded server is the fallback used when the configured interpreter
++    // is empty or not usable. If it is missing as well, report the problem for
++    // the interpreter the user selected instead of the fallback server.
++    if (!interpreterPath.isEmpty() && path.isEmpty())
++        return Cantor::Backend::checkExecutable(i18n("Python interpreter"), interpreterPath, reason);
+     return Cantor::Backend::checkExecutable(QLatin1String("Cantor Python Server"), path, reason);
+ }
+ 
+diff --git a/src/backends/python/pythonbackend.kcfg b/src/backends/python/pythonbackend.kcfg
+index 6f08387b..aefa54b9 100644
+--- a/src/backends/python/pythonbackend.kcfg
++++ b/src/backends/python/pythonbackend.kcfg
+@@ -17,6 +17,10 @@
+     <entry name="autorunScripts" type="StringList">
+       <label>List of scripts to autorun at the beginning of session</label>
+     </entry>
++    <entry name="Interpreter" type="Url">
++      <label>Path to the Python interpreter used to run the backend server</label>
++      <default code="true">QUrl::fromLocalFile(QStandardPaths::findExecutable(QLatin1String("python3")))</default>
++    </entry>
+     <entry name="inlinePlotFormat" type="Enum">
+       <choices>
+         <choice name="pdf"/>
+diff --git a/src/backends/python/pythonsession.cpp b/src/backends/python/pythonsession.cpp
+index 46b21d72..14ce2670 100644
+--- a/src/backends/python/pythonsession.cpp
++++ b/src/backends/python/pythonsession.cpp
+@@ -19,8 +19,10 @@
+ 
+ #include <QDebug>
+ #include <QDir>
++#include <QElapsedTimer>
+ #include <QStandardPaths>
+ #include <QFileInfo>
++#include <QFile>
+ 
+ #include <KLocalizedString>
+ #include <KMessageBox>
+@@ -59,27 +61,101 @@ void PythonSession::login()
+     m_process = new QProcess(this);
+     m_process->setProcessChannelMode(QProcess::ForwardedErrorChannel);
+ 
++    // Try to use the external Python interpreter selected in the backend settings.
++    // If it is empty or not executable, fall back to the embedded server.
++    bool useExternalInterpreter = false;
++    const QString interpreterPath = PythonSettings::interpreter().toLocalFile();
++    if (!interpreterPath.isEmpty() && !QFileInfo(interpreterPath).isExecutable())
++        qWarning() << "The configured Python interpreter is not executable, falling back to the embedded server:" << interpreterPath;
++    if (!interpreterPath.isEmpty() && QFileInfo(interpreterPath).isExecutable())
++    {
++        QFile serverScriptFile(QStringLiteral(":/py/server.py"));
++        if (serverScriptFile.open(QIODevice::ReadOnly | QIODevice::Text))
++        {
++            const QString& serverScript = QString::fromUtf8(serverScriptFile.readAll());
++            if (!serverScript.isEmpty())
++            {
++                useExternalInterpreter = true;
++                m_process->start(interpreterPath, QStringList() << QStringLiteral("-u") << QStringLiteral("-c") << serverScript);
++            }
++        }
++    }
++
++    if (!useExternalInterpreter)
++    {
+ #ifdef Q_OS_WIN
+-    const QString& serverExecutablePath = QStandardPaths::findExecutable(QLatin1String("cantor_pythonserver.exe"));
+-	// On Windows QProcess can't handle paths with spaces, so add escaping
+-	m_process->start(QLatin1String("\"") + serverExecutablePath + QLatin1String("\""));
++        const QString& serverExecutablePath = QStandardPaths::findExecutable(QLatin1String("cantor_pythonserver.exe"));
++        // On Windows QProcess can't handle paths with spaces, so add escaping
++        m_process->start(QLatin1String("\"") + serverExecutablePath + QLatin1String("\""));
+ #else
+-    const QString& serverExecutablePath = QStandardPaths::findExecutable(QLatin1String("cantor_pythonserver"));
+-    m_process->start(serverExecutablePath);
++        const QString& serverExecutablePath = QStandardPaths::findExecutable(QLatin1String("cantor_pythonserver"));
++        m_process->start(serverExecutablePath);
+ #endif
++    }
+ 
+-    m_process->waitForStarted();
+-    m_process->waitForReadyRead();
+-    QTextStream stream(m_process->readAllStandardOutput());
++    if (!m_process->waitForStarted())
++    {
++        changeStatus(Session::Disable);
++        if (useExternalInterpreter)
++            Q_EMIT error(i18n("Failed to start the Python interpreter \"%1\", please check the path in the backend settings.", interpreterPath));
++        else
++            Q_EMIT error(i18n("Failed to start Cantor python server."));
++        Q_EMIT loginDone();
++        delete m_process;
++        m_process = nullptr;
++        return;
++    }
+ 
++    // Wait for the server to report that it is ready. The embedded server
++    // prints "ready" followed by a newline, the external Python server writes
++    // it without a newline, so accumulate the output instead of reading lines
++    // from a single snapshot of the process output. The wait is bounded in
++    // time so a program that starts but never reports readiness cannot block
++    // the login forever.
+     const QString& readyStatus = QString::fromLatin1("ready");
++    QString readyOutput;
++    bool ready = false;
++    QElapsedTimer readyTimer;
++    readyTimer.start();
+     while (m_process->state() == QProcess::Running)
+     {
+-        const QString& rl = stream.readLine();
+-        if (rl == readyStatus)
++        readyOutput += QString::fromUtf8(m_process->readAllStandardOutput());
++        if (readyOutput.contains(readyStatus))
++        {
++            ready = true;
++            break;
++        }
++        // only the tail of the output can still contain the "ready" token
++        if (readyOutput.size() > 64)
++            readyOutput = readyOutput.right(64);
++        const int remaining = 30000 - static_cast<int>(readyTimer.elapsed());
++        if (remaining <= 0 || !m_process->waitForReadyRead(remaining))
+             break;
+     }
+ 
++    // catch the output that arrived right when the last wait timed out
++    if (!ready)
++    {
++        readyOutput += QString::fromUtf8(m_process->readAllStandardOutput());
++        ready = readyOutput.contains(readyStatus) && m_process->state() == QProcess::Running;
++    }
++
++    if (!ready || m_process->state() != QProcess::Running)
++    {
++        changeStatus(Session::Disable);
++        if (useExternalInterpreter)
++            Q_EMIT error(i18n("The Python interpreter \"%1\" did not respond correctly. Please check the path in the backend settings.", interpreterPath));
++        else
++            Q_EMIT error(i18n("Failed to start Cantor python server."));
++        Q_EMIT loginDone();
++        if (m_process->state() != QProcess::NotRunning)
++            m_process->kill();
++        m_process->waitForFinished(1000);
++        delete m_process;
++        m_process = nullptr;
++        return;
++    }
++
+     connect(m_process, &QProcess::readyReadStandardOutput, this, &PythonSession::readOutput);
+     connect(m_process, &QProcess::errorOccurred, this, &PythonSession::reportServerProcessError);
+ 
+diff --git a/src/backends/python/server.py b/src/backends/python/server.py
+new file mode 100644
+index 00000000..7735876b
+--- /dev/null
++++ b/src/backends/python/server.py
+@@ -0,0 +1,264 @@
++#!/usr/bin/env python3
++# SPDX-License-Identifier: GPL-2.0-or-later
++# External server for Cantor's Python backend.
++# Wire protocol:
++#   message      := command RECORD_SEP arguments MESSAGE_END
++#   code result  := output UNIT_SEP error UNIT_SEP isError MESSAGE_END
++#   model result := records UNIT_SEP MESSAGE_END
++# Separators: RECORD_SEP=chr(30), UNIT_SEP=chr(31), MESSAGE_END=chr(29),
++#             FIELD_SEP=chr(17), VAR_SEP=chr(18).
++
++import sys
++
++
++def _start_server():
++    # The whole server implementation lives in the local scope of this
++    # function, so that no internal name leaks into the user namespace.
++    import os
++    import traceback
++    import types
++
++    _sys = sys
++
++    RECORD_SEP = chr(30)
++    UNIT_SEP = chr(31)
++    MESSAGE_END = chr(29)
++    FIELD_SEP = chr(17)
++    VAR_SEP = chr(18)
++    MESSAGE_END_BYTES = MESSAGE_END.encode('utf-8')
++
++    stdout_fd = _sys.stdout.fileno()
++    stdin_fd = _sys.stdin.fileno()
++    file_path = 'python_cantor_worksheet'
++
++    # User code is executed in the namespace of the __main__ module, like in
++    # the embedded server. This keeps introspection working: `from __main__
++    # import __dict__` (used by the code completion) and `globals()` must see
++    # the user's variables.
++    user_globals = _sys.modules['__main__'].__dict__
++    user_globals.pop('_start_server', None)
++
++
++    class CatchOut:
++        def __init__(self, std_stream):
++            self.value = ''
++            self.encoding = getattr(std_stream, 'encoding', None) or 'utf-8'
++
++        def flush(self):
++            pass
++
++        def write(self, text):
++            self.value += text
++
++        def writelines(self, lines):
++            self.value += ''.join(lines)
++
++        def isatty(self):
++            return False
++
++
++    output_backend = CatchOut(_sys.stdout)
++    error_backend = CatchOut(_sys.stderr)
++
++    # The embedded server exposes these names to the user's code as well,
++    # keep them for compatibility with existing worksheets.
++    user_globals['CatchOutPythonBackend'] = CatchOut
++    user_globals['outputPythonBackend'] = output_backend
++    user_globals['errorPythonBackend'] = error_backend
++    user_globals['sys'] = _sys
++
++
++    def send(text):
++        data = text.encode('utf-8', 'replace')
++        while data:
++            written = os.write(stdout_fd, data)
++            data = data[written:]
++
++
++    def print_user_traceback(stream, exc_type, exc_value, exc_tb):
++        # Print only the frames of the user's code, the server's own frames
++        # (compile/exec and this handler) are not relevant for the user.
++        frames = []
++        tb = exc_tb
++        while tb is not None:
++            code = tb.tb_frame.f_code
++            if code.co_filename == file_path:
++                # Build the summary without the frame globals: the user code
++                # runs in the __main__ namespace, whose loader would resolve
++                # any file name to the server script itself.
++                frames.append(traceback.FrameSummary(code.co_filename, tb.tb_lineno, code.co_name))
++            tb = tb.tb_next
++        lines = []
++        if frames:
++            lines.append('Traceback (most recent call last):\n')
++            lines.extend(traceback.format_list(frames))
++        lines.extend(traceback.format_exception_only(exc_type, exc_value))
++        stream.write(''.join(lines))
++
++
++    def run_code(command):
++        out = output_backend
++        err = error_backend
++        out.value = ''
++        err.value = ''
++        old_out = _sys.stdout
++        old_err = _sys.stderr
++        _sys.stdout = out
++        _sys.stderr = err
++        is_error = False
++        try:
++            try:
++                code = compile(command, file_path, 'single')
++            except (SyntaxError, ValueError):
++                code = compile(command, file_path, 'exec')
++            exec(code, user_globals, user_globals)
++        except KeyboardInterrupt:
++            # Like the embedded server, do not answer a command that was
++            # interrupted; a late answer could be matched to the next
++            # expression by the client.
++            return None
++        except BaseException:
++            print_user_traceback(err, *_sys.exc_info())
++            is_error = True
++        finally:
++            _sys.stdout = old_out
++            _sys.stderr = old_err
++
++        return out.value + UNIT_SEP + err.value + UNIT_SEP + ('1' if is_error else '0') + MESSAGE_END
++
++
++    def set_file_path(path, directory):
++        nonlocal file_path
++        _sys.argv = [path]
++        if not path:
++            _sys.path.insert(0, '')
++        else:
++            file_path = path
++            _sys.path.insert(0, directory)
++            user_globals['__file__'] = path
++
++
++    def get_variables(parse_value):
++        numpy_module = None
++        numpy_threshold = None
++        try:
++            import numpy
++            numpy_module = numpy
++            numpy_threshold = numpy.get_printoptions()['threshold']
++            numpy.set_printoptions(threshold=100000000)
++        except Exception:
++            numpy_module = None
++            numpy_threshold = None
++
++        records = []
++        for name, value in list(user_globals.items()):
++            if name.startswith('__'):
++                continue
++            if name in ('CatchOut', 'CatchOutPythonBackend', 'errorPythonBackend', 'outputPythonBackend'):
++                continue
++            if isinstance(value, (types.ModuleType, types.FunctionType, type)):
++                continue
++
++            value_string = ''
++            size_string = ''
++            type_string = ''
++            if parse_value:
++                try:
++                    value_string = repr(value)
++                except BaseException:
++                    value_string = ''
++                try:
++                    size_string = repr(_sys.getsizeof(value))
++                except BaseException:
++                    size_string = ''
++                try:
++                    type_string = repr(type(value))
++                except BaseException:
++                    type_string = ''
++
++            records.append(name + FIELD_SEP + value_string + FIELD_SEP + size_string + FIELD_SEP + type_string)
++
++        if numpy_module is not None:
++            try:
++                numpy_module.set_printoptions(threshold=numpy_threshold)
++            except BaseException:
++                pass
++
++        return ''.join(record + VAR_SEP for record in records) + VAR_SEP
++
++
++    def handle(message):
++        records = message.split(RECORD_SEP)
++        if len(records) != 2:
++            return None
++
++        command = records[0]
++        arguments = records[1]
++
++        if command == 'exit':
++            return False
++
++        if command == 'login':
++            return None
++
++        if command == 'setFilePath':
++            args = arguments.split(UNIT_SEP)
++            if len(args) == 2:
++                set_file_path(args[0], args[1])
++            return None
++
++        if command == 'code':
++            return run_code(arguments)
++
++        if command == 'model':
++            try:
++                parse_value = bool(int(arguments))
++            except ValueError:
++                return UNIT_SEP + "Invalid argument for 'model' command" + MESSAGE_END
++            try:
++                return get_variables(parse_value) + UNIT_SEP + MESSAGE_END
++            except BaseException:
++                # Always answer the model command, otherwise the client's
++                # expression would wait forever for the reply.
++                traceback.print_exc(file=_sys.stderr)
++                return UNIT_SEP + MESSAGE_END
++
++        return None
++
++
++    def main():
++        send('ready')
++        buffer = b''
++        while True:
++            try:
++                chunk = os.read(stdin_fd, 4096)
++            except KeyboardInterrupt:
++                continue
++            except OSError:
++                break
++
++            if not chunk:
++                break
++
++            buffer += chunk
++            while MESSAGE_END_BYTES in buffer:
++                raw, buffer = buffer.split(MESSAGE_END_BYTES, 1)
++                message = raw.decode('utf-8', 'replace')
++                try:
++                    result = handle(message)
++                except KeyboardInterrupt:
++                    continue
++                except BaseException:
++                    traceback.print_exc(file=_sys.stderr)
++                    result = None
++
++                if result is False:
++                    return
++                if result:
++                    send(result)
++
++    main()
++
++
++if __name__ == '__main__':
++    _start_server()
+diff --git a/src/backends/python/settings.ui b/src/backends/python/settings.ui
+index 77e32e7e..5524631f 100644
+--- a/src/backends/python/settings.ui
++++ b/src/backends/python/settings.ui
+@@ -39,6 +39,20 @@
+         </widget>
+        </item>
+        <item row="1" column="0">
++        <widget class="QLabel" name="lInterpreter">
++         <property name="text">
++          <string>Python interpreter:</string>
++         </property>
++        </widget>
++       </item>
++       <item row="1" column="1">
++        <widget class="KUrlRequester" name="kcfg_Interpreter">
++         <property name="toolTip">
++          <string>Python 3 interpreter used to run the backend server. Point this to a virtualenv or Conda interpreter to switch Python environments. Changes take effect when a new session is started.</string>
++         </property>
++        </widget>
++       </item>
++       <item row="2" column="0">
+         <spacer name="verticalSpacer_2">
+          <property name="orientation">
+           <enum>Qt::Vertical</enum>
+@@ -54,7 +68,7 @@
+          </property>
+         </spacer>
+        </item>
+-       <item row="2" column="0">
++       <item row="3" column="0">
+         <widget class="QLabel" name="label_4">
+          <property name="font">
+           <font>
+@@ -67,14 +81,14 @@
+          </property>
+         </widget>
+        </item>
+-       <item row="3" column="0">
++       <item row="4" column="0">
+         <widget class="QLabel" name="lPlotIntegration">
+          <property name="text">
+           <string>Integrated:</string>
+          </property>
+         </widget>
+        </item>
+-       <item row="3" column="1">
++       <item row="4" column="1">
+         <widget class="QCheckBox" name="kcfg_integratePlots">
+          <property name="toolTip">
+           <string>If enabled, plots will be shown inside of the worksheet. Otherwise, plots will be shown in an external window.</string>
+@@ -84,14 +98,14 @@
+          </property>
+         </widget>
+        </item>
+-       <item row="4" column="0">
++       <item row="5" column="0">
+         <widget class="QLabel" name="label_5">
+          <property name="text">
+           <string>Size:</string>
+          </property>
+         </widget>
+        </item>
+-       <item row="4" column="1">
++       <item row="5" column="1">
+         <widget class="QFrame" name="frame">
+          <property name="frameShape">
+           <enum>QFrame::NoFrame</enum>
+@@ -172,14 +186,14 @@
+          </layout>
+         </widget>
+        </item>
+-       <item row="5" column="0">
++       <item row="6" column="0">
+         <widget class="QLabel" name="label_3">
+          <property name="text">
+           <string>Image Format:</string>
+          </property>
+         </widget>
+        </item>
+-       <item row="5" column="1">
++       <item row="6" column="1">
+         <widget class="QComboBox" name="kcfg_inlinePlotFormat">
+          <item>
+           <property name="text">
+@@ -198,7 +212,7 @@
+          </item>
+         </widget>
+        </item>
+-       <item row="6" column="0">
++       <item row="7" column="0">
+         <widget class="QLabel" name="label4">
+          <property name="toolTip">
+           <string>Graphic package to be used in the Plot Assistant</string>
+@@ -208,7 +222,7 @@
+          </property>
+         </widget>
+        </item>
+-       <item row="6" column="1">
++       <item row="7" column="1">
+         <widget class="KComboBox" name="kcfg_plotExtenstionGraphicPackage">
+          <property name="sizePolicy">
+           <sizepolicy hsizetype="Expanding" vsizetype="Fixed">
+@@ -246,7 +260,7 @@
+          </item>
+         </widget>
+        </item>
+-       <item row="7" column="0">
++       <item row="8" column="0">
+         <spacer name="verticalSpacer">
+          <property name="orientation">
+           <enum>Qt::Vertical</enum>
+@@ -301,6 +315,11 @@
+    <extends>QWidget</extends>
+    <header>keditlistwidget.h</header>
+   </customwidget>
++  <customwidget>
++   <class>KUrlRequester</class>
++   <extends>QWidget</extends>
++   <header>kurlrequester.h</header>
++  </customwidget>
+  </customwidgets>
+  <resources/>
+  <connections/>
+-- 
+2.43.0
+

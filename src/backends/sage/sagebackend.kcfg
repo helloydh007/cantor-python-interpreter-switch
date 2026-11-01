@@ -1,0 +1,40 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<kcfg xmlns="https://www.kde.org/standards/kcfg/1.0"
+      xmlns:xsi="https://www.w3.org/2001/XMLSchema-instance"
+      xsi:schemaLocation="https://www.kde.org/standards/kcfg/1.0
+                          https://www.kde.org/standards/kcfg/1.0/kcfg.xsd" >
+  <include>QStandardPaths</include>
+  <kcfgfile name="cantorrc"/>
+  <group name="SageBackend">
+    <entry name="Path" type="Url">
+      <label>Path to the Sage executable</label>
+      <default code="true">QUrl::fromLocalFile(QStandardPaths::findExecutable( QLatin1String("sage") ))</default>
+    </entry>
+    <entry name="allowLatex" type="Bool">
+      <label>Enable LaTeX typesetting for Sage backend</label>
+      <default>true</default>
+    </entry>
+    <entry name="integratePlots" type="Bool">
+      <label>Integrate Plots into the Worksheet</label>
+      <default>true</default>
+    </entry>
+    <entry name="inlinePlotFormat" type="Enum">
+      <choices>
+        <choice name="pdf"/>
+        <choice name="png"/>
+      </choices>
+      <default>0</default>
+    </entry>
+    <entry name="plotWidth" type="Double">
+      <label>Default plot width</label>
+      <default>12.0</default>
+    </entry>
+    <entry name="plotHeight" type="Double">
+      <label>Default plot height</label>
+      <default>8.0</default>
+    </entry>
+    <entry name="autorunScripts" type="StringList">
+      <label>List of scripts to autorun at the beginning of session</label>
+    </entry>
+  </group>
+</kcfg>
