@@ -1,10 +1,12 @@
+<p align="right">
+  <img src="assets/zcode-badge.svg" alt="Modified with ZCode" height="30">
+</p>
+
 # Cantor — runtime Python interpreter switching
 
-> **Modified with ZCode** · 2026-11-01
->
-> This repository is a snapshot of [KDE Cantor](https://apps.kde.org/cantor/) branch
-> `release/24.05` (upstream commit `a4fb818b`) plus one patch that lets the Python
-> backend use a Python interpreter chosen at runtime.
+This repository is a snapshot of [KDE Cantor](https://apps.kde.org/cantor/) branch
+`release/24.05` (upstream commit `a4fb818b`) plus one patch that lets the Python
+backend use a Python interpreter chosen at runtime.
 
 ## What this fork adds
 
