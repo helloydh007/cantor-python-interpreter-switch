@@ -24,12 +24,41 @@
 #include "ui_settings.h"
 #include "../backendsettingswidget.h"
 
+#include <QAtomicInt>
+#include <QList>
+#include <QMetaObject>
+#include <QPair>
+#include <QSet>
+#include <QSharedPointer>
+#include <QString>
+#include <QStringList>
+
 class PythonSettingsWidget : public BackendSettingsWidget, public Ui::PythonSettingsBase
 {
   Q_OBJECT
 
   public:
     explicit PythonSettingsWidget(QWidget* parent = nullptr, const QString& id = QString());
+    ~PythonSettingsWidget() override;
+
+  private Q_SLOTS:
+    void refreshEnvironments();
+    void environmentSelected(int index);
+    void browseEnvironmentFolder();
+    void restoreSearchFoldersOnCancel();
+    void cancelEnvironmentScan();
+
+  private:
+    void populateEnvironmentCombo(const QList<QPair<QString, QString>>& candidates);
+    void storeSearchFolders(const QStringList& folders);
+
+    bool m_refreshing = false;
+    bool m_refreshPending = false;
+    QSharedPointer<QAtomicInt> m_scanCancel;
+    quint64 m_scanGeneration = 0;
+    QStringList m_searchFoldersBeforeEdit;
+    bool m_searchFoldersSnapshotValid = false;
+    QMetaObject::Connection m_dialogRejectedConnection;
 };
 
 #endif /* _PYTHONSETTINGSWIDGET_H */

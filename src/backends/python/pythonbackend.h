@@ -8,6 +8,11 @@
 
 #include "backend.h"
 
+#include <QList>
+#include <QString>
+
+class PythonSession;
+
 class PythonBackend : public Cantor::Backend
 {
   Q_OBJECT
@@ -25,6 +30,19 @@ class PythonBackend : public Cantor::Backend
     QString description() const override;
     bool requirementsFullfilled(QString* const reason = nullptr) const override;
     KConfigSkeleton* config() const override;
+
+    void registerSession(PythonSession* session);
+
+  private Q_SLOTS:
+    void handleConfigChanged();
+
+  private:
+    void logoutNextSession();
+
+    QList<PythonSession*> m_sessions;
+    QList<PythonSession*> m_pendingRestarts;
+    bool m_restartScheduled = false;
+    QString m_lastInterpreter;
 };
 
 

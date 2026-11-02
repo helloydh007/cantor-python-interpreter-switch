@@ -21,6 +21,9 @@
       <label>Path to the Python interpreter used to run the backend server</label>
       <default code="true">QUrl::fromLocalFile(QStandardPaths::findExecutable(QLatin1String("python3")))</default>
     </entry>
+    <entry name="SearchFolders" type="StringList">
+      <label>Additional folders scanned for Python environments</label>
+    </entry>
     <entry name="inlinePlotFormat" type="Enum">
       <choices>
         <choice name="pdf"/>

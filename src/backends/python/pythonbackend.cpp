@@ -12,8 +12,11 @@
 
 #include <QDebug>
 #include <QFileInfo>
+#include <QTimer>
+#include <QUrl>
 #include <QWidget>
 
+#include <KConfigSkeleton>
 #include <KPluginFactory>
 
 PythonBackend::PythonBackend(QObject* parent, const QList<QVariant>& args) : Cantor::Backend(parent, args)
@@ -25,6 +28,9 @@ PythonBackend::PythonBackend(QObject* parent, const QList<QVariant>& args) : Can
     new PythonVariableManagementExtension(this);
 
     //setObjectName(QLatin1String("python3backend"));
+
+    m_lastInterpreter = PythonSettings::interpreter().toLocalFile();
+    connect(PythonSettings::self(), &KConfigSkeleton::configChanged, this, &PythonBackend::handleConfigChanged);
 }
 
 QWidget* PythonBackend::settingsWidget(QWidget* parent) const
@@ -34,7 +40,66 @@ QWidget* PythonBackend::settingsWidget(QWidget* parent) const
 
 Cantor::Session* PythonBackend::createSession()
 {
-    return new PythonSession(this);
+    auto* session = new PythonSession(this);
+    registerSession(session);
+    return session;
+}
+
+void PythonBackend::registerSession(PythonSession* session)
+{
+    if (!session)
+        return;
+
+    m_sessions.append(session);
+    connect(session, &QObject::destroyed, this, [this, session]() {
+        m_sessions.removeOne(session);
+        m_pendingRestarts.removeOne(session);
+    });
+}
+
+void PythonBackend::handleConfigChanged()
+{
+    const QString interpreter = PythonSettings::interpreter().toLocalFile();
+    if (interpreter == m_lastInterpreter)
+        return;
+
+    m_lastInterpreter = interpreter;
+
+    // Stop the active sessions. They stay Disabled and the next evaluation
+    // logs in again on demand with the new interpreter, so the settings dialog
+    // never has to wait synchronously for an interpreter to start.
+    m_pendingRestarts.clear();
+    for (PythonSession* session : qAsConst(m_sessions))
+    {
+        if (session && session->status() != Cantor::Session::Disable)
+            m_pendingRestarts.append(session);
+    }
+
+    // Only one logout chain is ever queued; later configuration changes just
+    // refresh the pending list.
+    if (!m_pendingRestarts.isEmpty() && !m_restartScheduled)
+    {
+        m_restartScheduled = true;
+        QTimer::singleShot(0, this, &PythonBackend::logoutNextSession);
+    }
+}
+
+void PythonBackend::logoutNextSession()
+{
+    if (m_pendingRestarts.isEmpty())
+    {
+        m_restartScheduled = false;
+        return;
+    }
+
+    PythonSession* session = m_pendingRestarts.takeFirst();
+    if (session && m_sessions.contains(session) && session->status() != Cantor::Session::Disable)
+        session->logout();
+
+    if (m_pendingRestarts.isEmpty())
+        m_restartScheduled = false;
+    else
+        QTimer::singleShot(0, this, &PythonBackend::logoutNextSession);
 }
 
 QString PythonBackend::id() const

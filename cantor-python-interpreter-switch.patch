@@ -1,30 +1,3 @@
-From 09745b6c10b79daebfae40753983b3f7a696bb1e Mon Sep 17 00:00:00 2001
-From: helloydh007 <296340111+helloydh007@users.noreply.github.com>
-Date: Sun, 1 Nov 2026 22:55:12 +0800
-Subject: [PATCH] Python backend: allow selecting the interpreter at runtime
-
-Add an Interpreter setting (URL, defaults to python3) to the Python
-backend. When it points to an executable, the session runs the newly
-added pure-Python server (src/backends/python/server.py, embedded via
-python.qrc) with that interpreter instead of the libpython-linked
-cantor_pythonserver binary. Empty or unusable paths fall back to the
-embedded server, preserving the previous behaviour.
-
-The external server implements the same wire protocol as the embedded
-one (code/model/setFilePath/exit, capture of stdout/stderr, variable
-introspection, interrupt handling). Also make the login handshake
-tolerate a 'ready' token without a trailing newline and fail cleanly
-when the process cannot start.
----
- src/backends/python/python.qrc         |   1 +
- src/backends/python/pythonbackend.cpp  |  12 ++
- src/backends/python/pythonbackend.kcfg |   4 +
- src/backends/python/pythonsession.cpp  |  96 ++++++++-
- src/backends/python/server.py          | 264 +++++++++++++++++++++++++
- src/backends/python/settings.ui        |  39 +++-
- 6 files changed, 396 insertions(+), 20 deletions(-)
- create mode 100644 src/backends/python/server.py
-
 diff --git a/src/backends/python/python.qrc b/src/backends/python/python.qrc
 index 5c6b133b..365517f0 100644
 --- a/src/backends/python/python.qrc
@@ -37,18 +10,101 @@ index 5c6b133b..365517f0 100644
      </qresource>
  </RCC>
 diff --git a/src/backends/python/pythonbackend.cpp b/src/backends/python/pythonbackend.cpp
-index db6cfea6..4abcd4ee 100644
+index db6cfea6..18ce96fd 100644
 --- a/src/backends/python/pythonbackend.cpp
 +++ b/src/backends/python/pythonbackend.cpp
-@@ -11,6 +11,7 @@
+@@ -11,8 +11,12 @@
  #include "ui_settings.h"
  
  #include <QDebug>
 +#include <QFileInfo>
++#include <QTimer>
++#include <QUrl>
  #include <QWidget>
  
++#include <KConfigSkeleton>
  #include <KPluginFactory>
-@@ -80,11 +81,22 @@ KConfigSkeleton* PythonBackend::config() const
+ 
+ PythonBackend::PythonBackend(QObject* parent, const QList<QVariant>& args) : Cantor::Backend(parent, args)
+@@ -24,6 +28,9 @@ PythonBackend::PythonBackend(QObject* parent, const QList<QVariant>& args) : Can
+     new PythonVariableManagementExtension(this);
+ 
+     //setObjectName(QLatin1String("python3backend"));
++
++    m_lastInterpreter = PythonSettings::interpreter().toLocalFile();
++    connect(PythonSettings::self(), &KConfigSkeleton::configChanged, this, &PythonBackend::handleConfigChanged);
+ }
+ 
+ QWidget* PythonBackend::settingsWidget(QWidget* parent) const
+@@ -33,7 +40,66 @@ QWidget* PythonBackend::settingsWidget(QWidget* parent) const
+ 
+ Cantor::Session* PythonBackend::createSession()
+ {
+-    return new PythonSession(this);
++    auto* session = new PythonSession(this);
++    registerSession(session);
++    return session;
++}
++
++void PythonBackend::registerSession(PythonSession* session)
++{
++    if (!session)
++        return;
++
++    m_sessions.append(session);
++    connect(session, &QObject::destroyed, this, [this, session]() {
++        m_sessions.removeOne(session);
++        m_pendingRestarts.removeOne(session);
++    });
++}
++
++void PythonBackend::handleConfigChanged()
++{
++    const QString interpreter = PythonSettings::interpreter().toLocalFile();
++    if (interpreter == m_lastInterpreter)
++        return;
++
++    m_lastInterpreter = interpreter;
++
++    // Stop the active sessions. They stay Disabled and the next evaluation
++    // logs in again on demand with the new interpreter, so the settings dialog
++    // never has to wait synchronously for an interpreter to start.
++    m_pendingRestarts.clear();
++    for (PythonSession* session : qAsConst(m_sessions))
++    {
++        if (session && session->status() != Cantor::Session::Disable)
++            m_pendingRestarts.append(session);
++    }
++
++    // Only one logout chain is ever queued; later configuration changes just
++    // refresh the pending list.
++    if (!m_pendingRestarts.isEmpty() && !m_restartScheduled)
++    {
++        m_restartScheduled = true;
++        QTimer::singleShot(0, this, &PythonBackend::logoutNextSession);
++    }
++}
++
++void PythonBackend::logoutNextSession()
++{
++    if (m_pendingRestarts.isEmpty())
++    {
++        m_restartScheduled = false;
++        return;
++    }
++
++    PythonSession* session = m_pendingRestarts.takeFirst();
++    if (session && m_sessions.contains(session) && session->status() != Cantor::Session::Disable)
++        session->logout();
++
++    if (m_pendingRestarts.isEmpty())
++        m_restartScheduled = false;
++    else
++        QTimer::singleShot(0, this, &PythonBackend::logoutNextSession);
+ }
+ 
+ QString PythonBackend::id() const
+@@ -80,11 +146,22 @@ KConfigSkeleton* PythonBackend::config() const
  
  bool PythonBackend::requirementsFullfilled(QString* const reason) const
  {
@@ -71,17 +127,56 @@ index db6cfea6..4abcd4ee 100644
      return Cantor::Backend::checkExecutable(QLatin1String("Cantor Python Server"), path, reason);
  }
  
+diff --git a/src/backends/python/pythonbackend.h b/src/backends/python/pythonbackend.h
+index 6e42421b..6a047539 100644
+--- a/src/backends/python/pythonbackend.h
++++ b/src/backends/python/pythonbackend.h
+@@ -8,6 +8,11 @@
+ 
+ #include "backend.h"
+ 
++#include <QList>
++#include <QString>
++
++class PythonSession;
++
+ class PythonBackend : public Cantor::Backend
+ {
+   Q_OBJECT
+@@ -25,6 +30,19 @@ class PythonBackend : public Cantor::Backend
+     QString description() const override;
+     bool requirementsFullfilled(QString* const reason = nullptr) const override;
+     KConfigSkeleton* config() const override;
++
++    void registerSession(PythonSession* session);
++
++  private Q_SLOTS:
++    void handleConfigChanged();
++
++  private:
++    void logoutNextSession();
++
++    QList<PythonSession*> m_sessions;
++    QList<PythonSession*> m_pendingRestarts;
++    bool m_restartScheduled = false;
++    QString m_lastInterpreter;
+ };
+ 
+ 
 diff --git a/src/backends/python/pythonbackend.kcfg b/src/backends/python/pythonbackend.kcfg
-index 6f08387b..aefa54b9 100644
+index 6f08387b..7ff8b874 100644
 --- a/src/backends/python/pythonbackend.kcfg
 +++ b/src/backends/python/pythonbackend.kcfg
-@@ -17,6 +17,10 @@
+@@ -17,6 +17,13 @@
      <entry name="autorunScripts" type="StringList">
        <label>List of scripts to autorun at the beginning of session</label>
      </entry>
 +    <entry name="Interpreter" type="Url">
 +      <label>Path to the Python interpreter used to run the backend server</label>
 +      <default code="true">QUrl::fromLocalFile(QStandardPaths::findExecutable(QLatin1String("python3")))</default>
++    </entry>
++    <entry name="SearchFolders" type="StringList">
++      <label>Additional folders scanned for Python environments</label>
 +    </entry>
      <entry name="inlinePlotFormat" type="Enum">
        <choices>
@@ -213,6 +308,519 @@ index 46b21d72..14ce2670 100644
      connect(m_process, &QProcess::readyReadStandardOutput, this, &PythonSession::readOutput);
      connect(m_process, &QProcess::errorOccurred, this, &PythonSession::reportServerProcessError);
  
+diff --git a/src/backends/python/pythonsettingswidget.cpp b/src/backends/python/pythonsettingswidget.cpp
+index 26ff43b1..56ab457c 100644
+--- a/src/backends/python/pythonsettingswidget.cpp
++++ b/src/backends/python/pythonsettingswidget.cpp
+@@ -19,6 +19,220 @@
+  */
+ 
+ #include "pythonsettingswidget.h"
++#include "settings.h"
++
++#include <QComboBox>
++#include <QDialog>
++#include <QDir>
++#include <QDirIterator>
++#include <QFile>
++#include <QFileDialog>
++#include <QFileInfo>
++#include <QFutureWatcher>
++#include <QProcess>
++#include <QPushButton>
++#include <QRegularExpression>
++#include <QSet>
++#include <QStandardItemModel>
++#include <QStandardPaths>
++#include <QTimer>
++#include <QUrl>
++#include <QVariant>
++#include <QtConcurrent>
++
++#include <KConfigDialog>
++#include <KConfigSkeleton>
++#include <KLocalizedString>
++
++namespace
++{
++const int maxEnvironmentCandidates = 64;
++const int maxProbeCount = 24;
++const int maxScannedFolders = 500;
++
++QString probePythonVersion(const QString& pythonPath)
++{
++    if (pythonPath.isEmpty())
++        return QString();
++
++    QProcess process;
++    process.start(pythonPath, QStringList() << QStringLiteral("-c")
++                 << QStringLiteral("import sys;print('%d.%d.%d' % sys.version_info[:3])"));
++
++    if (!process.waitForStarted(1500))
++        return QString();
++
++    if (!process.waitForFinished(1500))
++    {
++        process.kill();
++        process.waitForFinished(1000);
++        return QString();
++    }
++
++    if (process.exitStatus() != QProcess::NormalExit || process.exitCode() != 0)
++        return QString();
++
++    return QString::fromLocal8Bit(process.readAllStandardOutput()).trimmed();
++}
++
++bool isEnvironmentFolder(const QString& folder)
++{
++    return QFile::exists(folder + QLatin1String("/pyvenv.cfg"))
++        || QFile::exists(folder + QLatin1String("/bin/python"))
++        || QFile::exists(folder + QLatin1String("/bin/python3"))
++        || QFile::exists(folder + QLatin1String("/Scripts/python.exe"));
++}
++
++void scanFolderForEnvironmentsRecursively(const QString& folder, int depth, int maxDepth,
++                                          QStringList& found, int& visited, const QAtomicInt* cancel)
++{
++    if (!cancel || cancel->loadAcquire())
++        return;
++
++    if (folder.isEmpty() || depth > maxDepth || found.size() >= maxEnvironmentCandidates)
++        return;
++
++    if (visited >= maxScannedFolders)
++        return;
++
++    const QFileInfo folderInfo(folder);
++    if (!folderInfo.exists() || !folderInfo.isDir())
++        return;
++
++    ++visited;
++
++    if (isEnvironmentFolder(folder))
++    {
++        found << folder;
++        return;
++    }
++
++    // Iterate lazily instead of materializing the whole listing, so that an
++    // extremely large directory cannot exhaust memory before the visit cap
++    // is reached.
++    QDirIterator iterator(folder, QDir::Dirs | QDir::NoDotAndDotDot | QDir::NoSymLinks,
++                          QDirIterator::NoIteratorFlags);
++    while (iterator.hasNext())
++    {
++        if (cancel->loadAcquire() || found.size() >= maxEnvironmentCandidates || visited >= maxScannedFolders)
++            break;
++
++        iterator.next();
++        scanFolderForEnvironmentsRecursively(iterator.fileInfo().absoluteFilePath(), depth + 1, maxDepth,
++                                             found, visited, cancel);
++    }
++}
++
++QList<QPair<QString, QString>> collectEnvironments(const QString& currentPath, const QStringList& roots,
++                                                   const QAtomicInt* cancel)
++{
++    QList<QPair<QString, QString>> candidates;
++    QSet<QString> seen;
++    int probed = 0;
++
++    const auto addCandidate = [&](const QString& pythonPath) {
++        if (!cancel || cancel->loadAcquire() || pythonPath.isEmpty()
++            || candidates.size() >= maxEnvironmentCandidates)
++            return;
++
++        const QFileInfo info(pythonPath);
++        if (!info.exists() || !info.isFile() || !info.isExecutable())
++            return;
++
++        QString canonical = info.canonicalFilePath();
++        if (canonical.isEmpty())
++            canonical = pythonPath;
++        if (seen.contains(canonical))
++            return;
++        seen.insert(canonical);
++
++        QString version;
++        if (probed < maxProbeCount)
++        {
++            ++probed;
++            version = probePythonVersion(pythonPath);
++        }
++
++        candidates.append(qMakePair(pythonPath, version));
++    };
++
++    // The interpreter currently configured in the main setting comes first.
++    addCandidate(currentPath);
++
++    // System-wide candidates.
++    const QString python3 = QStandardPaths::findExecutable(QStringLiteral("python3"));
++    if (!python3.isEmpty())
++        addCandidate(python3);
++
++    const QRegularExpression python3Pattern(QStringLiteral("^python3(\\.[0-9]+)*[a-z]*$"));
++
++    QDir usrBin(QStringLiteral("/usr/bin"));
++    const QStringList usrBinEntries = usrBin.entryList(QStringList() << QStringLiteral("python3.*"),
++                                                       QDir::Files | QDir::Executable, QDir::Name);
++    for (const QString& entry : usrBinEntries)
++    {
++        if (python3Pattern.match(entry).hasMatch())
++            addCandidate(usrBin.absoluteFilePath(entry));
++    }
++
++    QDir usrLocalBin(QStringLiteral("/usr/local/bin"));
++    const QStringList usrLocalBinEntries = usrLocalBin.entryList(QStringList() << QStringLiteral("python3*"),
++                                                                 QDir::Files | QDir::Executable, QDir::Name);
++    for (const QString& entry : usrLocalBinEntries)
++    {
++        if (python3Pattern.match(entry).hasMatch())
++            addCandidate(usrLocalBin.absoluteFilePath(entry));
++    }
++
++    // Environment roots. Folders added by the user are scanned first so that
++    // they are not crowded out by a large default environment collection.
++    QStringList found;
++    int visited = 0;
++    for (const QString& root : roots)
++    {
++        if (!cancel || cancel->loadAcquire())
++            break;
++
++        scanFolderForEnvironmentsRecursively(root, 0, 3, found, visited, cancel);
++    }
++
++    for (const QString& environmentPath : found)
++    {
++        if (!cancel || cancel->loadAcquire() || candidates.size() >= maxEnvironmentCandidates)
++            break;
++
++        QString interpreterPath;
++        const QStringList interpreterCandidates {
++            environmentPath + QLatin1String("/bin/python3"),
++            environmentPath + QLatin1String("/bin/python"),
++            environmentPath + QLatin1String("/Scripts/python.exe")
++        };
++        for (const QString& candidate : interpreterCandidates)
++        {
++            const QFileInfo candidateInfo(candidate);
++            if (candidateInfo.exists() && candidateInfo.isFile() && candidateInfo.isExecutable())
++            {
++                interpreterPath = candidate;
++                break;
++            }
++        }
++
++        addCandidate(interpreterPath);
++    }
++
++    return candidates;
++}
++
++void disableComboItem(QComboBox* comboBox, int index)
++{
++    auto* model = qobject_cast<QStandardItemModel*>(comboBox->model());
++    if (!model)
++        return;
++
++    if (QStandardItem* item = model->item(index))
++        item->setFlags(item->flags() & ~Qt::ItemIsEnabled);
++}
++}
+ 
+ PythonSettingsWidget::PythonSettingsWidget(QWidget* parent, const QString& id) : BackendSettingsWidget(parent, id)
+ {
+@@ -27,4 +241,241 @@ PythonSettingsWidget::PythonSettingsWidget(QWidget* parent, const QString& id) :
+     m_tabWidget = tabWidget;
+     m_tabDocumentation = tabDocumentation;
+     connect(tabWidget, &QTabWidget::currentChanged, this, &BackendSettingsWidget::tabChanged);
++
++    connect(envComboBox, QOverload<int>::of(&QComboBox::activated), this, &PythonSettingsWidget::environmentSelected);
++    connect(btnDetectEnvs, &QPushButton::clicked, this, &PythonSettingsWidget::refreshEnvironments);
++    connect(btnBrowseEnvs, &QPushButton::clicked, this, &PythonSettingsWidget::browseEnvironmentFolder);
++
++    // The settings dialog is shown non-modally and is not deleted by its owner,
++    // so arrange for it to be destroyed on close and stop any running scan
++    // when the dialog goes away.
++    if (KConfigDialog* dialog = qobject_cast<KConfigDialog*>(window()))
++    {
++        dialog->setAttribute(Qt::WA_DeleteOnClose);
++        connect(dialog, &QDialog::rejected, this, &PythonSettingsWidget::cancelEnvironmentScan);
++        connect(dialog, &QDialog::accepted, this, &PythonSettingsWidget::cancelEnvironmentScan);
++    }
++
++    QTimer::singleShot(0, this, &PythonSettingsWidget::refreshEnvironments);
++}
++
++PythonSettingsWidget::~PythonSettingsWidget()
++{
++    // Ask a still running worker to stop as soon as possible. The worker holds
++    // its own reference to the flag, so it stays valid until the worker exits.
++    cancelEnvironmentScan();
++}
++
++void PythonSettingsWidget::cancelEnvironmentScan()
++{
++    if (m_scanCancel)
++        m_scanCancel->storeRelease(1);
++    m_scanCancel.reset();
++
++    // Invalidate a result that is still in flight and allow a later refresh
++    // if this widget outlives the scan (e.g. the dialog was only hidden).
++    ++m_scanGeneration;
++    m_refreshing = false;
++    m_refreshPending = false;
++}
++
++void PythonSettingsWidget::refreshEnvironments()
++{
++    if (m_refreshing)
++    {
++        m_refreshPending = true;
++        return;
++    }
++
++    m_refreshing = true;
++
++    if (m_scanCancel)
++        m_scanCancel->storeRelease(1);
++
++    const QSharedPointer<QAtomicInt> cancel = QSharedPointer<QAtomicInt>::create(0);
++    m_scanCancel = cancel;
++    const quint64 generation = ++m_scanGeneration;
++
++    const QString currentPath = kcfg_Interpreter->url().toLocalFile();
++
++    // User supplied folders are scanned before the default locations.
++    QStringList roots = PythonSettings::searchFolders();
++    const QString home = QDir::homePath();
++    roots << home + QLatin1String("/.virtualenvs")
++          << home + QLatin1String("/venvs")
++          << home + QLatin1String("/.local/share/virtualenvs")
++          << home + QLatin1String("/miniconda3/envs")
++          << home + QLatin1String("/anaconda3/envs")
++          << home + QLatin1String("/.conda/envs");
++    roots.removeDuplicates();
++
++    envComboBox->blockSignals(true);
++    envComboBox->clear();
++    envComboBox->addItem(i18n("Scanning for Python interpreters…"));
++    disableComboItem(envComboBox, 0);
++    envComboBox->blockSignals(false);
++    btnDetectEnvs->setEnabled(false);
++
++    auto* watcher = new QFutureWatcher<QList<QPair<QString, QString>>>(this);
++    connect(watcher, &QFutureWatcher<QList<QPair<QString, QString>>>::finished, this,
++            [this, watcher, generation]() {
++                const QList<QPair<QString, QString>> candidates = watcher->result();
++                watcher->deleteLater();
++                if (generation != m_scanGeneration)
++                    return;
++                populateEnvironmentCombo(candidates);
++            });
++    watcher->setFuture(QtConcurrent::run([currentPath, roots, cancel]() {
++        return collectEnvironments(currentPath, roots, cancel.data());
++    }));
++}
++
++void PythonSettingsWidget::populateEnvironmentCombo(const QList<QPair<QString, QString>>& candidates)
++{
++    const QString currentPath = kcfg_Interpreter->url().toLocalFile();
++    const QString currentCanonical = QFileInfo(currentPath).canonicalFilePath();
++
++    envComboBox->blockSignals(true);
++    envComboBox->clear();
++
++    int currentIndex = -1;
++    for (const QPair<QString, QString>& candidate : candidates)
++    {
++        const QString path = candidate.first;
++        const QString version = candidate.second;
++
++        bool isCurrent = false;
++        if (!currentPath.isEmpty())
++        {
++            if (path == currentPath)
++                isCurrent = true;
++            else
++            {
++                const QString itemCanonical = QFileInfo(path).canonicalFilePath();
++                isCurrent = !currentCanonical.isEmpty() && !itemCanonical.isEmpty()
++                    && itemCanonical == currentCanonical;
++            }
++        }
++
++        const QString versionText = version.isEmpty() ? QStringLiteral("—") : QStringLiteral("v") + version;
++        const QString text = isCurrent
++            ? i18n("Current — %1 — %2", versionText, path)
++            : QStringLiteral("%1 — %2").arg(versionText, path);
++
++        envComboBox->addItem(text, path);
++        envComboBox->setItemData(envComboBox->count() - 1, path, Qt::ToolTipRole);
++
++        if (isCurrent && currentIndex < 0)
++            currentIndex = envComboBox->count() - 1;
++    }
++
++    if (envComboBox->count() == 0)
++    {
++        envComboBox->addItem(i18n("No Python interpreters found"));
++        disableComboItem(envComboBox, 0);
++        currentIndex = 0;
++    }
++    else if (currentIndex < 0)
++        currentIndex = 0;
++
++    envComboBox->setCurrentIndex(currentIndex);
++    envComboBox->blockSignals(false);
++
++    btnDetectEnvs->setEnabled(true);
++    m_refreshing = false;
++
++    if (m_refreshPending)
++    {
++        m_refreshPending = false;
++        QTimer::singleShot(0, this, &PythonSettingsWidget::refreshEnvironments);
++    }
++}
++
++void PythonSettingsWidget::environmentSelected(int index)
++{
++    if (index < 0)
++        return;
++
++    const QString path = envComboBox->itemData(index).toString();
++    if (path.isEmpty())
++        return;
++
++    const QFileInfo info(path);
++    if (!info.exists() || !info.isFile() || !info.isExecutable())
++        return;
++
++    kcfg_Interpreter->setUrl(QUrl::fromLocalFile(path));
++    envComboBox->setToolTip(path);
++}
++
++void PythonSettingsWidget::browseEnvironmentFolder()
++{
++    const QString folder = QFileDialog::getExistingDirectory(this, i18n("Select a folder containing Python environments"));
++    if (folder.isEmpty())
++        return;
++
++    QStringList folders = PythonSettings::searchFolders();
++    const QString canonical = QFileInfo(folder).canonicalFilePath();
++
++    bool alreadyListed = false;
++    for (const QString& existing : qAsConst(folders))
++    {
++        const QString existingCanonical = QFileInfo(existing).canonicalFilePath();
++        if (existing == folder
++            || (!canonical.isEmpty() && !existingCanonical.isEmpty() && canonical == existingCanonical))
++        {
++            alreadyListed = true;
++            break;
++        }
++    }
++
++    if (!alreadyListed)
++    {
++        if (!m_searchFoldersSnapshotValid)
++        {
++            m_searchFoldersBeforeEdit = folders;
++            m_searchFoldersSnapshotValid = true;
++
++            // SearchFolders has no widget of its own, so KConfigDialogManager
++            // does not save it. Persist it here and roll it back if the dialog
++            // is cancelled.
++            if (KConfigDialog* dialog = qobject_cast<KConfigDialog*>(window()))
++            {
++                m_dialogRejectedConnection = connect(dialog, &QDialog::rejected,
++                                                    this, &PythonSettingsWidget::restoreSearchFoldersOnCancel);
++                // An Apply commits the change; Cancel afterwards must not undo it.
++                connect(dialog, &KConfigDialog::settingsChanged, this, [this](const QString&) {
++                    m_searchFoldersSnapshotValid = false;
++                    disconnect(m_dialogRejectedConnection);
++                });
++            }
++        }
++
++        folders << folder;
++        storeSearchFolders(folders);
++        PythonSettings::self()->save();
++    }
++
++    refreshEnvironments();
++}
++
++void PythonSettingsWidget::restoreSearchFoldersOnCancel()
++{
++    if (!m_searchFoldersSnapshotValid)
++        return;
++
++    storeSearchFolders(m_searchFoldersBeforeEdit);
++    PythonSettings::self()->save();
++
++    m_searchFoldersSnapshotValid = false;
++    disconnect(m_dialogRejectedConnection);
++}
++
++void PythonSettingsWidget::storeSearchFolders(const QStringList& folders)
++{
++    // PythonSettings has no generated setter because its .kcfgc does not
++    // enable mutators, so update the skeleton item directly.
++    KConfigSkeletonItem* item = PythonSettings::self()->findItem(QStringLiteral("SearchFolders"));
++    if (item)
++        item->setProperty(QVariant(folders));
+ }
+diff --git a/src/backends/python/pythonsettingswidget.h b/src/backends/python/pythonsettingswidget.h
+index 80e9dba6..8d1d0cc7 100644
+--- a/src/backends/python/pythonsettingswidget.h
++++ b/src/backends/python/pythonsettingswidget.h
+@@ -24,12 +24,41 @@
+ #include "ui_settings.h"
+ #include "../backendsettingswidget.h"
+ 
++#include <QAtomicInt>
++#include <QList>
++#include <QMetaObject>
++#include <QPair>
++#include <QSet>
++#include <QSharedPointer>
++#include <QString>
++#include <QStringList>
++
+ class PythonSettingsWidget : public BackendSettingsWidget, public Ui::PythonSettingsBase
+ {
+   Q_OBJECT
+ 
+   public:
+     explicit PythonSettingsWidget(QWidget* parent = nullptr, const QString& id = QString());
++    ~PythonSettingsWidget() override;
++
++  private Q_SLOTS:
++    void refreshEnvironments();
++    void environmentSelected(int index);
++    void browseEnvironmentFolder();
++    void restoreSearchFoldersOnCancel();
++    void cancelEnvironmentScan();
++
++  private:
++    void populateEnvironmentCombo(const QList<QPair<QString, QString>>& candidates);
++    void storeSearchFolders(const QStringList& folders);
++
++    bool m_refreshing = false;
++    bool m_refreshPending = false;
++    QSharedPointer<QAtomicInt> m_scanCancel;
++    quint64 m_scanGeneration = 0;
++    QStringList m_searchFoldersBeforeEdit;
++    bool m_searchFoldersSnapshotValid = false;
++    QMetaObject::Connection m_dialogRejectedConnection;
+ };
+ 
+ #endif /* _PYTHONSETTINGSWIDGET_H */
 diff --git a/src/backends/python/server.py b/src/backends/python/server.py
 new file mode 100644
 index 00000000..7735876b
@@ -484,10 +1092,10 @@ index 00000000..7735876b
 +if __name__ == '__main__':
 +    _start_server()
 diff --git a/src/backends/python/settings.ui b/src/backends/python/settings.ui
-index 77e32e7e..5524631f 100644
+index 77e32e7e..0fab1939 100644
 --- a/src/backends/python/settings.ui
 +++ b/src/backends/python/settings.ui
-@@ -39,6 +39,20 @@
+@@ -39,6 +39,48 @@
          </widget>
         </item>
         <item row="1" column="0">
@@ -505,24 +1113,52 @@ index 77e32e7e..5524631f 100644
 +        </widget>
 +       </item>
 +       <item row="2" column="0">
++        <widget class="QLabel" name="lDetectedEnvs">
++         <property name="text">
++          <string>Detected:</string>
++         </property>
++        </widget>
++       </item>
++       <item row="2" column="1">
++        <widget class="QComboBox" name="envComboBox">
++         <property name="sizeAdjustPolicy">
++          <enum>QComboBox::AdjustToContents</enum>
++         </property>
++        </widget>
++       </item>
++       <item row="2" column="2">
++        <widget class="QPushButton" name="btnDetectEnvs">
++         <property name="text">
++          <string>Refresh</string>
++         </property>
++        </widget>
++       </item>
++       <item row="2" column="3">
++        <widget class="QPushButton" name="btnBrowseEnvs">
++         <property name="text">
++          <string>Add folder…</string>
++         </property>
++        </widget>
++       </item>
++       <item row="3" column="0">
          <spacer name="verticalSpacer_2">
           <property name="orientation">
            <enum>Qt::Vertical</enum>
-@@ -54,7 +68,7 @@
+@@ -54,7 +96,7 @@
           </property>
          </spacer>
         </item>
 -       <item row="2" column="0">
-+       <item row="3" column="0">
++       <item row="4" column="0">
          <widget class="QLabel" name="label_4">
           <property name="font">
            <font>
-@@ -67,14 +81,14 @@
+@@ -67,14 +109,14 @@
           </property>
          </widget>
         </item>
 -       <item row="3" column="0">
-+       <item row="4" column="0">
++       <item row="5" column="0">
          <widget class="QLabel" name="lPlotIntegration">
           <property name="text">
            <string>Integrated:</string>
@@ -530,16 +1166,16 @@ index 77e32e7e..5524631f 100644
          </widget>
         </item>
 -       <item row="3" column="1">
-+       <item row="4" column="1">
++       <item row="5" column="1">
          <widget class="QCheckBox" name="kcfg_integratePlots">
           <property name="toolTip">
            <string>If enabled, plots will be shown inside of the worksheet. Otherwise, plots will be shown in an external window.</string>
-@@ -84,14 +98,14 @@
+@@ -84,14 +126,14 @@
           </property>
          </widget>
         </item>
 -       <item row="4" column="0">
-+       <item row="5" column="0">
++       <item row="6" column="0">
          <widget class="QLabel" name="label_5">
           <property name="text">
            <string>Size:</string>
@@ -547,16 +1183,16 @@ index 77e32e7e..5524631f 100644
          </widget>
         </item>
 -       <item row="4" column="1">
-+       <item row="5" column="1">
++       <item row="6" column="1">
          <widget class="QFrame" name="frame">
           <property name="frameShape">
            <enum>QFrame::NoFrame</enum>
-@@ -172,14 +186,14 @@
+@@ -172,14 +214,14 @@
           </layout>
          </widget>
         </item>
 -       <item row="5" column="0">
-+       <item row="6" column="0">
++       <item row="7" column="0">
          <widget class="QLabel" name="label_3">
           <property name="text">
            <string>Image Format:</string>
@@ -564,38 +1200,38 @@ index 77e32e7e..5524631f 100644
          </widget>
         </item>
 -       <item row="5" column="1">
-+       <item row="6" column="1">
++       <item row="7" column="1">
          <widget class="QComboBox" name="kcfg_inlinePlotFormat">
           <item>
            <property name="text">
-@@ -198,7 +212,7 @@
+@@ -198,7 +240,7 @@
           </item>
          </widget>
         </item>
 -       <item row="6" column="0">
-+       <item row="7" column="0">
++       <item row="8" column="0">
          <widget class="QLabel" name="label4">
           <property name="toolTip">
            <string>Graphic package to be used in the Plot Assistant</string>
-@@ -208,7 +222,7 @@
+@@ -208,7 +250,7 @@
           </property>
          </widget>
         </item>
 -       <item row="6" column="1">
-+       <item row="7" column="1">
++       <item row="8" column="1">
          <widget class="KComboBox" name="kcfg_plotExtenstionGraphicPackage">
           <property name="sizePolicy">
            <sizepolicy hsizetype="Expanding" vsizetype="Fixed">
-@@ -246,7 +260,7 @@
+@@ -246,7 +288,7 @@
           </item>
          </widget>
         </item>
 -       <item row="7" column="0">
-+       <item row="8" column="0">
++       <item row="9" column="0">
          <spacer name="verticalSpacer">
           <property name="orientation">
            <enum>Qt::Vertical</enum>
-@@ -301,6 +315,11 @@
+@@ -301,6 +343,11 @@
     <extends>QWidget</extends>
     <header>keditlistwidget.h</header>
    </customwidget>
@@ -607,6 +1243,3 @@ index 77e32e7e..5524631f 100644
   </customwidgets>
   <resources/>
   <connections/>
--- 
-2.43.0
-
