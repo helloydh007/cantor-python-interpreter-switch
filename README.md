@@ -65,6 +65,15 @@ print(sys.version)
 `sys.executable` shows the interpreter actually in use. If it shows
 `cantor_pythonserver`, the embedded fallback is active.
 
+## AppImage notes
+
+The AppImage's `AppRun` sets `PATH` (including `$APPDIR/usr/bin`),
+`LD_LIBRARY_PATH`, `QT_PLUGIN_PATH` and `XDG_DATA_DIRS` explicitly. This matters
+when the host has no `python3` on `PATH`: the Python backend then falls back to
+the bundled `cantor_pythonserver` instead of reporting "No Backend Found". The
+other backends (Sage, Octave, Maxima, Scilab) are built but their interpreters
+are not bundled; pick Python in the backend chooser.
+
 ## Files changed
 
 - `src/backends/python/pythonbackend.kcfg` — new `Interpreter` entry and
